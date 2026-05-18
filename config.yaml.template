@@ -1,0 +1,58 @@
+# 多模型辩论系统配置
+# 模型列表：每个模型通过 Anthropic API 兼容方式接入
+# 使用说明：复制本文件为 config.yaml，然后填入你的实际 API 密钥
+
+models:
+  kimi_k2.6:
+    name: "kimi-coding-k2.6"
+    provider: "anthropic"
+    model_id: "kimi-for-coding"
+    # 方式1：通过环境变量读取（推荐，避免密钥泄露）
+    api_key_env: "KIMI_API_KEY"
+    # 方式2：直接填写密钥（不安全，仅本地测试使用）
+    # api_key: "your-api-key-here"
+    base_url: "https://api.kimi.com/coding"
+    temperature: 0.3
+    max_tokens: 60000
+    role: "proposer"
+    critique_style: "standard"
+    # 最大推理深度：reasoning_effort=high 让模型充分思考
+    extra_body:
+      reasoning_effort: high
+
+  deepseek_v4:
+    name: "deepseek-v4"
+    provider: "anthropic"
+    model_id: "deepseek-v4-pro"
+    # 方式1：通过环境变量读取（推荐，避免密钥泄露）
+    api_key_env: "DEEPSEEK_API_KEY"
+    # 方式2：直接填写密钥（不安全，仅本地测试使用）
+    # api_key: "your-api-key-here"
+    base_url: "https://api.deepseek.com/anthropic"
+    temperature: 0.3
+    max_tokens: 60000  # reasoning + content 总长度，需要更大空间
+    role: "proposer"
+    critique_style: "adversarial"
+    # 最大推理深度：deepseek 原生 reasoning，通过 extra_body 请求最大 effort
+    extra_body:
+      reasoning_effort: high
+
+# 辩论配置
+debate:
+  consensus_threshold: 0.85
+  min_confidence: 0.70
+
+# 场景配置
+scenarios:
+  question_analysis:
+    name: "问题分析"
+    description: "对开放性问题进行多角度分析"
+  financial_interpretation:
+    name: "财务数据解读"
+    description: "分析财务报表、关键指标和趋势"
+  event_analysis:
+    name: "事件分析"
+    description: "评估事件对公司的影响和潜在后果"
+  risk_assessment:
+    name: "风险评估"
+    description: "识别和评估投资及经营风险"
