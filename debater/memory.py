@@ -25,7 +25,8 @@ class MemoryManager:
     def __init__(self, debate_id: str, topic: str):
         self.debate_id = debate_id
         self.topic = topic
-        self.root = Path("/Users/lunight/dev/debater/memories")
+        # 基于项目根目录动态计算 memories 路径（项目根 = debater/ 的父目录）
+        self.root = Path(__file__).parent.parent / "memories"
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "stage_memory").mkdir(exist_ok=True)
         (self.root / "obsidian").mkdir(exist_ok=True)

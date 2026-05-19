@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 
 def _setup_logger(name: str, log_path: str, max_bytes: int = 5 * 1024 * 1024) -> logging.Logger:
@@ -77,32 +78,68 @@ llm_logger = setup_llm_logger()
 session_logger = setup_session_logger()
 
 
+import re
+
+
+# 敏感信息脱敏模式
+_SENSITIVE_PATTERNS = [
+    # API Keys
+    (re.compile(r'sk-[a-zA-Z0-9]{20,}'), 'sk-***REDACTED***'),
+    (re.compile(r'api[_-]?key\s*[:=]\s*["\']?[a-zA-Z0-9_-]{10,}["\']?', re.IGNORECASE), 'api_key=***REDACTED***'),
+    (re.compile(r'password\s*[:=]\s*["\']?[^\s"\']+["\']?', re.IGNORECASE), 'password=***REDACTED***'),
+    (re.compile(r'secret\s*[:=]\s*["\']?[^\s"\']+["\']?', re.IGNORECASE), 'secret=***REDACTED***'),
+    (re.compile(r'token\s*[:=]\s*["\']?[a-zA-Z0-9_-]{10,}["\']?', re.IGNORECASE), 'token=***REDACTED***'),
+    # 邮箱
+    (re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'), '***EMAIL***'),
+    # 手机号（中国大陆）
+    (re.compile(r'1[3-9]\d{9}'), '***PHONE***'),
+]
+
+
+def _sanitize(text: Optional[str]) -> str:
+    """脱敏：替换日志中的敏感信息"""
+    if not isinstance(text, str):
+        return ""
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def log_prompt(logger: logging.Logger, label: str, system_prompt: str, user_prompt: str):
     """打印 prompt 摘要到日志
     
-    打印长度和开头预览，方便排查 prompt 结构问题。
+    打印长度和开头预览（截断 + 脱敏），避免敏感信息泄露和日志膨胀。
     """
+    SYS_CUTOFF = 600
+    USER_CUTOFF = 1200
+    safe_sys = _sanitize(system_prompt[:SYS_CUTOFF])
+    safe_user = _sanitize(user_prompt[:USER_CUTOFF])
     logger.info(f"{'='*60}")
     logger.info(f"[PROMPT] {label}")
     logger.info(f"{'='*60}")
-    logger.info(f"system_prompt: len={len(system_prompt)} preview=\n{system_prompt[:400]}")
-    logger.info(f"user_prompt:   len={len(user_prompt)} preview=\n{user_prompt[:800]}")
+    logger.info(f"system_prompt: len={len(system_prompt)} preview=\n{safe_sys}")
+    if len(system_prompt) > SYS_CUTOFF:
+        logger.info(f"... ({len(system_prompt) - SYS_CUTOFF} chars omitted) ...")
+    logger.info(f"user_prompt:   len={len(user_prompt)} preview=\n{safe_user}")
+    if len(user_prompt) > USER_CUTOFF:
+        logger.info(f"... ({len(user_prompt) - USER_CUTOFF} chars omitted) ...")
     logger.info(f"{'='*60}")
 
 
 def log_response(logger: logging.Logger, label: str, text: str):
     """打印响应到日志
     
-    打印完整响应（或长度+预览），方便排查模型输出问题。
+    打印响应摘要（截断 + 脱敏），方便排查模型输出问题。
     """
+    MAX_LOG_LEN = 2000  # 比原来 3000 更保守
+    safe_text = _sanitize(text)
     logger.info(f"[RESPONSE] {label} | len={len(text)}")
-    # 打印完整内容，但限制在 3000 字以内避免日志过大
-    if len(text) <= 3000:
-        logger.info(f"FULL:\n{text}")
+    if len(safe_text) <= MAX_LOG_LEN:
+        logger.info(f"FULL:\n{safe_text}")
     else:
-        logger.info(f"HEAD:\n{text[:1500]}")
-        logger.info(f"... ({len(text)-3000} chars omitted) ...")
-        logger.info(f"TAIL:\n{text[-1500:]}")
+        logger.info(f"HEAD:\n{safe_text[:MAX_LOG_LEN // 2]}")
+        logger.info(f"... ({len(text) - MAX_LOG_LEN} chars omitted) ...")
+        logger.info(f"TAIL:\n{safe_text[-MAX_LOG_LEN // 2:]}")
     logger.info(f"{'='*60}")
 
 

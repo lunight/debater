@@ -56,7 +56,8 @@ def create_debate_graph() -> StateGraph:
     # 条件边：判断下一步
     def route_after_judge(state: DebateState) -> Literal["critique", "aggregate"]:
         """根据 judge 结果决定下一步"""
-        if state.get("consensus_reached", False):
+        # 安全截断：达到最大轮次强制结束，防止无限循环
+        if state.get("consensus_reached", False) or state.get("round", 0) >= state.get("max_rounds", 3):
             return "aggregate"
         # 未达成共识，继续下一轮
         return "critique"

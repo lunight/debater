@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from debater.session import Stage, DebateSession
+from debater.engine import extract_confidence, extract_thinking, extract_summary
 
 
 @pytest.fixture
@@ -61,50 +62,50 @@ class TestStageConstants:
 
 
 class TestExtractThinking:
-    def test_extracts_thinking_tag(self, session):
+    def test_extracts_thinking_tag(self):
         """应提取 <thinking> 标签内容"""
         text = "<thinking>my reasoning</thinking>\nformal answer"
-        thinking, formal = session._extract_thinking(text)
+        thinking, formal = extract_thinking(text)
         assert thinking == "my reasoning"
         assert formal == "formal answer"
 
-    def test_no_thinking_tag(self, session):
+    def test_no_thinking_tag(self):
         """无 thinking 标签时应返回空和原文"""
         text = "just plain answer"
-        thinking, formal = session._extract_thinking(text)
+        thinking, formal = extract_thinking(text)
         assert thinking == ""
         assert formal == "just plain answer"
 
-    def test_multiline_thinking(self, session):
+    def test_multiline_thinking(self):
         """应支持多行 thinking 内容"""
         text = "<thinking>line1\nline2\nline3</thinking>\nanswer"
-        thinking, formal = session._extract_thinking(text)
+        thinking, formal = extract_thinking(text)
         assert "line1" in thinking
         assert "line3" in thinking
         assert "answer" == formal
 
 
 class TestExtractConfidence:
-    def test_chinese_format(self, session):
+    def test_chinese_format(self):
         """应解析中文置信度格式"""
         text = "结论成立。置信度：85%"
-        assert session._extract_confidence(text) == 0.85
+        assert extract_confidence(text) == 0.85
 
-    def test_english_format(self, session):
+    def test_english_format(self):
         """应解析英文置信度格式"""
         text = "Confidence: 92.5%"
-        assert session._extract_confidence(text) == 0.925
+        assert extract_confidence(text) == 0.925
 
-    def test_no_confidence_returns_default(self, session):
+    def test_no_confidence_returns_default(self):
         """无置信度时应返回默认值 0.7"""
         text = "no confidence here"
-        assert session._extract_confidence(text) == 0.7
+        assert extract_confidence(text) == 0.7
 
-    def test_clamps_out_of_range(self, session):
+    def test_clamps_out_of_range(self):
         """超出范围的值应被裁剪到 [0, 1]"""
-        assert session._extract_confidence("置信度：150%") == 1.0
+        assert extract_confidence("置信度：150%") == 1.0
         # 负号被 regex 忽略，匹配到 10 -> 0.1，这是已知边界行为
-        assert session._extract_confidence("置信度：-10%") == 0.1
+        assert extract_confidence("置信度：-10%") == 0.1
 
 
 class TestBuildCritiqueHistoryText:

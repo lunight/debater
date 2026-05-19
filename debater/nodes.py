@@ -27,22 +27,7 @@ from .llm_client import LLMClient
 from . import prompts
 from .tools import ToolRegistry
 from .logger import llm_logger
-
-
-# ==================== 工具函数 ====================
-
-def _extract_confidence(text: str) -> float:
-    """从回答中提取置信度 (0.0~1.0)"""
-    patterns = [
-        r'置信度[^\d]*(\d+(?:\.\d+)?)\s*%',
-        r'(?:confidence|Confidence)[^\d]*(\d+(?:\.\d+)?)\s*%',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            val = float(match.group(1))
-            return min(max(val / 100.0, 0.0), 1.0)
-    return 0.7
+from .engine import extract_confidence, parse_judge_output
 
 
 def _build_reasoning_log(state: DebateState) -> str:
@@ -339,7 +324,7 @@ class DebateNodes:
                     )
 
                     state["answers"][role_id] = full_text
-                    state["confidences"][role_id] = _extract_confidence(full_text)
+                    state["confidences"][role_id] = extract_confidence(full_text)
                     state["previous_answers"][role_id] = full_text
                     print(f"   ✅ {role_id} ({model_id}): 置信度 {state['confidences'][role_id]*100:.0f}% ({resp.latency_ms:.0f}ms)")
                 except Exception as e:
@@ -355,13 +340,24 @@ class DebateNodes:
 
     # ---------- 评审节点（串行：bear → bull） ----------
 
+    def _get_critique_pair(self, round_num: int) -> tuple:
+        """返回当前轮次的 (critic_role, target_role)"""
+        if round_num % 2 == 1:
+            return "bear", "bull"
+        return "bull", "bear"
+    
+    def _get_reviser(self, round_num: int) -> str:
+        """返回当前轮次需要修订的角色"""
+        if round_num % 2 == 1:
+            return "bull"
+        return "bear"
+
     def critique(self, state: DebateState) -> DebateState:
-        """评审阶段：串行单方向评审（bear 评审 bull）"""
-        print(f"\n🔄 第 {state['round']} 轮：bear 评审 bull...")
+        """评审阶段：串行单方向评审（奇数轮 bear→bull，偶数轮 bull→bear）"""
+        critic_role, target_role = self._get_critique_pair(state["round"])
+        print(f"\n🔄 第 {state['round']} 轮：{critic_role} 评审 {target_role}...")
 
         role_models = state.get("role_models", {})
-        critic_role = "bear"
-        target_role = "bull"
         model_id = role_models.get(critic_role)
 
         if not model_id:
@@ -404,15 +400,15 @@ class DebateNodes:
     # ---------- 修订节点（串行：bull only） ----------
 
     def revise(self, state: DebateState) -> DebateState:
-        """修订阶段：串行单个角色修订（bull 根据 bear 的评审修订）"""
-        print(f"\n🔄 第 {state['round']} 轮：bull 修订回答...")
+        """修订阶段：串行单个角色修订（被评审方根据评审意见修订）"""
+        role_id = self._get_reviser(state["round"])
+        print(f"\n🔄 第 {state['round']} 轮：{role_id} 修订回答...")
 
         role_models = state.get("role_models", {})
-        role_id = "bull"
         model_id = role_models.get(role_id)
 
         if not model_id:
-            llm_logger.warning("[nodes.revise] bull 未分配模型，跳过修订")
+            llm_logger.warning(f"[nodes.revise] {role_id} 未分配模型，跳过修订")
             return state
 
         try:
@@ -446,7 +442,7 @@ class DebateNodes:
             )
 
             state["answers"][role_id] = resp.content
-            state["confidences"][role_id] = _extract_confidence(resp.content)
+            state["confidences"][role_id] = extract_confidence(resp.content)
             state["previous_answers"][role_id] = resp.content
             print(f"   ✅ {role_id} ({model_id}): 修订后置信度 {state['confidences'][role_id]*100:.0f}%")
         except Exception as e:
@@ -485,31 +481,20 @@ class DebateNodes:
                 temperature=0.2,
             )
 
-            content = resp.content.strip()
-            # 尝试提取 JSON 块
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(1)
-
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                brace_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if brace_match:
-                    try:
-                        result = json.loads(brace_match.group(0))
-                    except json.JSONDecodeError:
-                        result = {"action": "continue", "reason": f"JSON 解析失败: {content[:200]}", "info_needed": ""}
-                else:
-                    result = {"action": "continue", "reason": f"无法解析 judge 输出: {content[:200]}", "info_needed": ""}
-
+            result = parse_judge_output(resp.content)
             action = result.get("action", "continue")
             if action not in ("continue", "stop", "need_info"):
                 action = "continue"
 
-            if action == "stop":
+            # 安全截断：达到最大轮次时强制结束，无论 LLM 返回什么 action
+            max_rounds_reached = state["round"] >= state["max_rounds"]
+
+            if action == "stop" or max_rounds_reached:
                 state["consensus_reached"] = True
-                print(f"   📌 裁判判定达成共识: {result.get('reason', '')[:80]}")
+                if max_rounds_reached and action != "stop":
+                    print(f"   📌 达到最大轮次 ({state['max_rounds']})，强制结束辩论")
+                else:
+                    print(f"   📌 裁判判定达成共识: {result.get('reason', '')[:80]}")
             elif action == "need_info":
                 state["consensus_reached"] = False
                 print(f"   📌 裁判判定需要补充信息: {result.get('info_needed', '')[:80]}")

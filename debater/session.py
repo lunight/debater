@@ -12,7 +12,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Generator
+from typing import Dict, List, Optional, Any, Generator, Tuple
 from dataclasses import dataclass, field
 
 from .llm_client import LLMClient
@@ -22,6 +22,7 @@ from .memory import MemoryManager
 from .skills import SkillRegistry
 from .tools import ToolRegistry
 from .logger import llm_logger, session_logger, log_prompt, log_response, log_event
+from .engine import extract_confidence, extract_thinking, extract_summary, parse_judge_output
 
 
 class Stage:
@@ -62,6 +63,7 @@ class DebateSession:
     
     # Memory 系统
     memory_manager: Optional[MemoryManager] = None
+    enable_memory: bool = False  # 默认关闭，减少不必要的 LLM 调用
     
     # 角色-模型映射：固定两个角色（bull / bear），各分配一个模型
     role_models: Dict[str, str] = field(default_factory=dict)
@@ -102,6 +104,27 @@ class DebateSession:
     
     # 类常量
     MAX_TOOL_ROUNDS = 10  # 每角色最多工具链 followup 轮数
+    
+    def _get_critique_pair(self) -> Tuple[str, str]:
+        """返回当前轮次的 (critic_role, target_role)
+        
+        奇数轮: bear → bull（bear 评审 bull）
+        偶数轮: bull → bear（bull 评审 bear）
+        """
+        if self.current_round % 2 == 1:
+            return "bear", "bull"
+        else:
+            return "bull", "bear"
+    
+    def _get_reviser(self) -> str:
+        """返回当前轮次需要修订的角色
+        
+        被评审的一方进行修订。
+        """
+        if self.current_round % 2 == 1:
+            return "bull"
+        else:
+            return "bear"
     
     def __post_init__(self):
         self._client = LLMClient()
@@ -177,13 +200,16 @@ class DebateSession:
         self._models = [m for m in self._models if m in available]
         # 如果有新模型加入配置，可以自动添加（但这里保持用户选择不变）
         
-        # 初始化 MemoryManager
-        from datetime import datetime
-        debate_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.memory_manager = MemoryManager(
-            debate_id=debate_id,
-            topic=self.question[:30],
-        )
+        # 初始化 MemoryManager（仅在启用时）
+        if self.enable_memory:
+            from datetime import datetime
+            debate_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.memory_manager = MemoryManager(
+                debate_id=debate_id,
+                topic=self.question[:30],
+            )
+        else:
+            self.memory_manager = None
         
         # 初始化 SkillRegistry 和 ToolRegistry
         self._skill_registry = SkillRegistry()
@@ -718,65 +744,6 @@ class DebateSession:
     
     # ==================== 工具方法 ====================
     
-    def _extract_thinking(self, text: str) -> tuple:
-        """从回答中提取 thinking 过程和正式输出
-        
-        同时移除 <tool_call> 和 <tool_result> 标签，避免它们出现在最终输出中。
-        """
-        match = re.search(r'<thinking>(.*?)</thinking>', text, re.DOTALL)
-        if match:
-            thinking = match.group(1).strip()
-            # 移除 thinking 标签后的正式输出
-            formal = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL).strip()
-        else:
-            thinking = ""
-            formal = text
-        
-        # 移除 tool_call 和 tool_result 标签（避免出现在最终输出中）
-        formal = re.sub(r'<tool(?:_call)?\s+name="[^"]+">\s*.*?\s*</tool(?:_call)?>', '', formal, flags=re.DOTALL).strip()
-        formal = re.sub(r'<tool_result\s+name="[^"]+">\s*.*?\s*</tool_result>', '', formal, flags=re.DOTALL).strip()
-        
-        return thinking, formal
-    
-    def _extract_confidence(self, text: str) -> float:
-        """从回答中提取置信度
-        
-        如果检测到工具失败导致的数据缺失关键词，强制降低置信度，
-        防止模型基于不完整信息给出高置信度结论。
-        """
-        # 检测工具失败导致的数据缺失——强制降权
-        data_gaps = [
-            "工具失败", "数据缺失", "无法获取", "无法验证", "未经工具验证",
-            "缺少关键数据", "缺少验证", "无法确认", "信息不足",
-            "工具调用失败", "搜索失败", "未找到相关结果",
-        ]
-        text_lower = text.lower()
-        has_data_gap = any(kw in text_lower for kw in data_gaps)
-        
-        patterns = [
-            r'置信度[^\d]*(\d+(?:\.\d+)?)\s*%',
-            r'(?:confidence|Confidence)[^\d]*(\d+(?:\.\d+)?)\s*%',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                val = float(match.group(1))
-                confidence = min(max(val / 100.0, 0.0), 1.0)
-                # 如果检测到数据缺失，强制不超过 50%
-                if has_data_gap:
-                    confidence = min(confidence, 0.5)
-                return confidence
-        
-        # 默认置信度：有数据缺失时更低
-        return 0.3 if has_data_gap else 0.7
-    
-    def _extract_summary(self, text: str) -> str:
-        """从回答中提取 <summary> 总结块"""
-        match = re.search(r'<summary>(.*?)</summary>', text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return ""
-    
     def _maybe_summarize(self) -> str:
         """获取 memory context 用于 prompt 注入
         
@@ -887,10 +854,10 @@ class DebateSession:
         responses = self._client.call_parallel(calls)
         
         for role_id, resp in responses.items():
-            thinking, formal = self._extract_thinking(resp.content)
+            thinking, formal = extract_thinking(resp.content)
             self.thinkings[role_id] = thinking
             self.answers[role_id] = formal
-            self.confidences[role_id] = self._extract_confidence(resp.content)
+            self.confidences[role_id] = extract_confidence(resp.content)
             self.previous_answers[role_id] = resp.content
         
         # === Tool call 处理（支持最多 MAX_TOOL_ROUNDS 轮）===
@@ -976,11 +943,11 @@ class DebateSession:
                 if not previous_analysis:
                     previous_analysis = "（你之前只调用了工具，尚未给出分析）"
             
-            thinking, formal = self._extract_thinking(full_text)
+            thinking, formal = extract_thinking(full_text)
             self.thinkings[role_id] = thinking
             self.answers[role_id] = formal
-            self.confidences[role_id] = self._extract_confidence(full_text)
-            self.summaries[role_id] = self._extract_summary(full_text)
+            self.confidences[role_id] = extract_confidence(full_text)
+            self.summaries[role_id] = extract_summary(full_text)
             self.previous_answers[role_id] = full_text
         
         self.stage = Stage.PAUSE_AFTER_GENERATE
@@ -1119,10 +1086,10 @@ class DebateSession:
                     if full_text is None:
                         return  # 失败，直接退出
                 
-                thinking, formal = self._extract_thinking(full_text)
+                thinking, formal = extract_thinking(full_text)
                 self.thinkings[role_id] = thinking
                 self.answers[role_id] = formal  # 用 answers 存 brainstorm 结果
-                self.summaries[role_id] = self._extract_summary(full_text)
+                self.summaries[role_id] = extract_summary(full_text)
                 
                 event_queue.put({
                     "type": "model_done",
@@ -1455,11 +1422,11 @@ class DebateSession:
                     if full_text is None:
                         return  # 失败，直接退出
                 
-                thinking, formal = self._extract_thinking(full_text)
+                thinking, formal = extract_thinking(full_text)
                 self.thinkings[role_id] = thinking
                 self.answers[role_id] = formal
-                self.confidences[role_id] = self._extract_confidence(full_text)
-                self.summaries[role_id] = self._extract_summary(full_text)
+                self.confidences[role_id] = extract_confidence(full_text)
+                self.summaries[role_id] = extract_summary(full_text)
                 self.previous_answers[role_id] = full_text
                 
                 log_event(
@@ -1729,11 +1696,11 @@ class DebateSession:
                             previous_analysis = "（你之前只调用了工具，尚未给出分析）"
                 
                 # 流式结束后解析
-                thinking, formal = self._extract_thinking(full_text)
+                thinking, formal = extract_thinking(full_text)
                 self.thinkings[role_id] = thinking
                 self.answers[role_id] = formal
-                self.confidences[role_id] = self._extract_confidence(full_text)
-                self.summaries[role_id] = self._extract_summary(full_text)
+                self.confidences[role_id] = extract_confidence(full_text)
+                self.summaries[role_id] = extract_summary(full_text)
                 self.previous_answers[role_id] = full_text
                 
                 yield {"type": "model_done", "role_id": role_id, "model_id": model_id, "full_text": full_text}
@@ -2067,11 +2034,11 @@ class DebateSession:
                         "accumulated": accumulated,
                     })
                 
-                thinking, formal = self._extract_thinking(full_text)
+                thinking, formal = extract_thinking(full_text)
                 self.thinkings[role_id] = thinking
                 self.answers[role_id] = formal
-                self.confidences[role_id] = self._extract_confidence(full_text)
-                self.summaries[role_id] = self._extract_summary(full_text)
+                self.confidences[role_id] = extract_confidence(full_text)
+                self.summaries[role_id] = extract_summary(full_text)
                 self.previous_answers[role_id] = full_text
                 
                 event_queue.put({
@@ -2248,11 +2215,11 @@ class DebateSession:
                     "accumulated": accumulated,
                 }
             
-            thinking, formal = self._extract_thinking(full_text)
+            thinking, formal = extract_thinking(full_text)
             self.thinkings[role_id] = thinking
             self.answers[role_id] = formal
-            self.confidences[role_id] = self._extract_confidence(full_text)
-            self.summaries[role_id] = self._extract_summary(full_text)
+            self.confidences[role_id] = extract_confidence(full_text)
+            self.summaries[role_id] = extract_summary(full_text)
             self.previous_answers[role_id] = full_text
             
             yield {"type": "model_done", "role_id": role_id, "model_id": model_id, "full_text": full_text}
@@ -2276,8 +2243,7 @@ class DebateSession:
         critique_history = self._build_all_critique_history_text(self.current_round)
         
         # 串行：bear 评审 bull
-        critic_role = "bear"
-        target_role = "bull"
+        critic_role, target_role = self._get_critique_pair()
         model_id = self.role_models.get(critic_role)
         
         if model_id:
@@ -2321,7 +2287,7 @@ class DebateSession:
         
         memory_context = self._maybe_summarize()
         
-        role_id = "bull"
+        role_id = self._get_reviser()
         model_id = self.role_models.get(role_id)
         
         if model_id:
@@ -2360,10 +2326,10 @@ class DebateSession:
                 user_prompt=user_prompt,
             )
             
-            thinking, formal = self._extract_thinking(resp.content)
+            thinking, formal = extract_thinking(resp.content)
             self.thinkings[role_id] = thinking
             self.answers[role_id] = formal
-            self.confidences[role_id] = self._extract_confidence(resp.content)
+            self.confidences[role_id] = extract_confidence(resp.content)
             self.previous_answers[role_id] = resp.content
         
         self.stage = Stage.PAUSE_AFTER_REVISE
@@ -2400,9 +2366,9 @@ class DebateSession:
         
         UI 层只需调用此方法，DebateSession 根据当前 stage 自动决定执行什么：
         - INIT                  -> generate_stream_parallel()
-        - PAUSE_AFTER_GENERATE  -> critique_stream_single("bear", "bull")
-        - PAUSE_AFTER_CRITIQUE  -> revise_stream_single("bull")
-        - PAUSE_AFTER_REVISE    -> current_round += 1, critique_stream_single("bear", "bull")
+        - PAUSE_AFTER_GENERATE  -> critique_stream_single(*_get_critique_pair())
+        - PAUSE_AFTER_CRITIQUE  -> revise_stream_single(_get_reviser())
+        - PAUSE_AFTER_REVISE    -> current_round += 1, critique_stream_single(*_get_critique_pair())
         
         每个 yield 的事件会注入 ``step_type`` 字段（"generate"/"critique"/"revise"），
         供 UI 层（如 run_stream）自动推断当前步骤类型，无需 UI 自行维护状态机。
@@ -2412,14 +2378,14 @@ class DebateSession:
             stream = self.generate_stream_parallel()
         elif self.stage == Stage.PAUSE_AFTER_GENERATE:
             step_type = "critique"
-            stream = self.critique_stream_single("bear", "bull")
+            stream = self.critique_stream_single(*self._get_critique_pair())
         elif self.stage == Stage.PAUSE_AFTER_CRITIQUE:
             step_type = "revise"
-            stream = self.revise_stream_single("bull")
+            stream = self.revise_stream_single(self._get_reviser())
         elif self.stage == Stage.PAUSE_AFTER_REVISE:
             step_type = "critique"
             self.current_round += 1
-            stream = self.critique_stream_single("bear", "bull")
+            stream = self.critique_stream_single(*self._get_critique_pair())
         else:
             raise ValueError(f"无法从 stage={self.stage} 执行下一步")
         
@@ -2466,15 +2432,15 @@ class DebateSession:
     def auto_debate_stream(self, max_cycles: int = 3) -> Generator[Dict[str, Any], None, None]:
         """自动辩论：严格串行交替 critique → revise → judge，直到统一或达到最大轮数
         
-        串行交替流程（按用户要求）：
-        1. bear 分析 bull 的问题（critique）
-        2. bull 根据 bear 的意见修订后再输出（revise）
+        串行交替流程：
+        1. 奇数轮: bear 分析 bull 的问题（critique）→ bull 修订
+        2. 偶数轮: bull 分析 bear 的问题（critique）→ bear 修订
         3. auto_judge 判断是否统一
-        4. 如果未统一且未达 max_cycles，进入下一轮（bear 继续分析 bull 的新问题）
+        4. 如果未统一且未达 max_cycles，进入下一轮（角色互换）
         
         与并行版本的区别：
-        - critique 和 revise 严格串行，先 bear critique bull，再 bull revise
-        - 不并行运行两个角色，保证一方输出后另一方才能基于最新输出进行反应
+        - critique 和 revise 严格串行，保证一方输出后另一方才能基于最新输出进行反应
+        - 双方轮流被评审和修订，避免单边辩论
         
         Args:
             max_cycles: 最大辩论轮数（每轮 = critique + revise + judge）
@@ -2490,16 +2456,18 @@ class DebateSession:
             self.current_round = cycle
             session_logger.info(f"========== AUTO DEBATE CYCLE {cycle} ==========")
             
-            # === Critique 阶段：bear → bull ===
+            # === Critique 阶段 ===
+            critic_role, target_role = self._get_critique_pair()
             self.stage = Stage.CRITIQUING
-            llm_logger.info(f"[auto_debate_stream] 开始第 {cycle} 轮 critique (bear → bull)")
-            for event in self.critique_stream_single("bear", "bull"):
+            llm_logger.info(f"[auto_debate_stream] 开始第 {cycle} 轮 critique ({critic_role} → {target_role})")
+            for event in self.critique_stream_single(critic_role, target_role):
                 yield event
             
-            # === Revise 阶段：bull ===
+            # === Revise 阶段 ===
+            reviser_role = self._get_reviser()
             self.stage = Stage.REVISING
-            llm_logger.info(f"[auto_debate_stream] 开始第 {cycle} 轮 revise (bull)")
-            for event in self.revise_stream_single("bull"):
+            llm_logger.info(f"[auto_debate_stream] 开始第 {cycle} 轮 revise ({reviser_role})")
+            for event in self.revise_stream_single(reviser_role):
                 yield event
             
             # === Judge 阶段 ===
@@ -2570,25 +2538,7 @@ class DebateSession:
                 temperature=0.2,
             )
             
-            # 解析 JSON 输出
-            content = resp.content.strip()
-            # 尝试提取 JSON 块（模型可能用 ```json 包裹）
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(1)
-            
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                # 如果解析失败，尝试找第一个 { 到最后一个 }
-                brace_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if brace_match:
-                    try:
-                        result = json.loads(brace_match.group(0))
-                    except json.JSONDecodeError:
-                        result = {"action": "continue", "reason": f"JSON 解析失败: {content[:200]}", "info_needed": ""}
-                else:
-                    result = {"action": "continue", "reason": f"无法解析 judge 输出: {content[:200]}", "info_needed": ""}
+            result = parse_judge_output(resp.content)
         except Exception as e:
             tb = traceback.format_exc()
             llm_logger.error(
@@ -2912,11 +2862,11 @@ class DebateSession:
                         previous_analysis = "（你之前只调用了工具，尚未给出分析）"
             
             # 保存结果
-            thinking, formal = self._extract_thinking(full_text)
+            thinking, formal = extract_thinking(full_text)
             self.thinkings[role_id] = thinking
             self.answers[role_id] = formal
-            self.confidences[role_id] = self._extract_confidence(full_text)
-            self.summaries[role_id] = self._extract_summary(full_text)
+            self.confidences[role_id] = extract_confidence(full_text)
+            self.summaries[role_id] = extract_summary(full_text)
             self.previous_answers[role_id] = full_text
             
             log_event(
@@ -3011,7 +2961,7 @@ class DebateSession:
         Returns:
             保存的文件路径
         """
-        save_dir = Path(save_dir or "/Users/lunight/dev/debater/saves")
+        save_dir = Path(save_dir or (Path(__file__).parent.parent / "saves"))
         save_dir.mkdir(parents=True, exist_ok=True)
         
         debate_id = self.memory_manager.debate_id if self.memory_manager else "unknown"

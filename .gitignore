@@ -4,6 +4,7 @@ config.yaml
 # 运行时数据（用户隐私）
 memories/
 logs/
+saves/
 
 # 环境变量
 .env
@@ -42,6 +43,9 @@ env/
 *.swp
 *.swo
 *~
+
+# 测试缓存
+.pytest_cache/
 
 # macOS
 .DS_Store
