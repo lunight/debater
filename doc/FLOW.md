@@ -1,6 +1,6 @@
 # 串行交替辩论流程 —— 完整流程图与 Prompt 详解
 
-> 版本: 2026-05-17
+> 版本: 2026-05-19
 
 ---
 
@@ -36,11 +36,11 @@
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Phase 2: Critique —— 【串行】bear → bull                                     │
+│ Phase 2: Critique —— 【串行】交替方向（奇数轮 bear→bull，偶数轮 bull→bear） │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────┐                   │
 │   │ 🐻 Bear 评审 Bull 的分析                             │                   │
-│   │ (deepseek_v4, 串行单方向)                           │                   │
+│   │ (串行单方向，角色按轮次交替)                        │                   │
 │   └──────────┬──────────────────────────────────────────┘                   │
 │              │ critiques["bear"]["bull"] = "..."                             │
 │              ▼                                                               │
@@ -51,14 +51,14 @@
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Phase 3: Revise —— 【串行】bull only                                         │
+│ Phase 3: Revise —— 【串行】被评审方修订                                      │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────┐                   │
 │   │ 🐂 Bull 根据 Bear 的评审意见修订                     │                   │
-│   │ (kimi_k2.6, 串行单角色)                             │                   │
+│   │ (串行单角色，按轮次交替)                            │                   │
 │   └──────────┬──────────────────────────────────────────┘                   │
-│              │ bull_answer = "修订后..."                                     │
-│              │ bear_answer = 保持不变                                       │
+│              │ reviser_answer = "修订后..."                                  │
+│              │ critic_answer = 保持不变（下一轮将被评审）                   │
 │              ▼                                                               │
 │   ┌─────────────────────────────────────────────────────┐                   │
 │   │ PAUSE_AFTER_REVISE                                  │                   │
@@ -95,9 +95,10 @@
 
 **串行交替的核心规则**：
 - `Generate` 只做 **1 次**（Round 1，双方并行）
-- 之后每轮循环：**Critique(bear→bull) → Revise(bull) → Judge**
-- `bear` 的答案从 `Generate` 后不再改变
-- `bull` 的答案每轮根据 `bear` 的评审修订一次
+- 之后每轮循环：**Critique → Revise → Judge**，角色按轮次交替
+- **奇数轮**：bear → bull（bear 评审 bull，bull 修订）
+- **偶数轮**：bull → bear（bull 评审 bear，bear 修订）
+- 双方都有机会被评审和修订，避免单边辩论
 
 ---
 
@@ -179,13 +180,13 @@
 
 ---
 
-### 2.2 Phase 2: Critique（串行：bear → bull）
+### 2.2 Phase 2: Critique（串行：交替方向）
 
-**调用方式**：`session.critique_stream_single("bear", "bull")` —— 只跑 bear 一个角色
+**调用方式**：`session.critique_stream_single(critic, target)` —— 只跑当前轮次的评审方一个角色
 
-> 关键：`other_answers = {"bull": bull_answer}`，只有 1 个目标，所以 prompt 会明确提示"你只需要评审 bull 的分析"
+> 关键：奇数轮 `("bear", "bull")`，偶数轮 `("bull", "bear")`。`other_answers` 只有 1 个目标，prompt 会明确提示"你只需要评审 {target} 的分析"
 
-#### 🐻 Bear 的 Prompt（唯一执行者）
+#### 当前轮次评审方的 Prompt（唯一执行者）
 
 **System Prompt**：
 ```
@@ -215,17 +216,17 @@
 3. 基于独立观点进行评审：评审不是"挑错游戏"，而是"我的分析 vs 你的分析"的对比
 
 【你的分析】
-{bear_answer}            ← Bear 自己上一轮的分析
+{critic_answer}          ← 评审方自己上一轮的分析
 
-【bull 的分析】
-{bull_answer}            ← 要评审的目标
+【{target} 的分析】
+{target_answer}          ← 要评审的目标
 
 【历史评审记录】{critique_history}  ← 避免重复指出已修正的问题
 
-请按以下步骤对 **bull** 的分析师进行评审：
+请按以下步骤对 **{target}** 的分析师进行评审：
 
 > 重要提示：以上【你的分析】是你自己之前的观点，仅作为对比参考。
-> 你**只需要评审 bull 的分析**，不要在评审中讨论或评判你自己的分析。
+> 你**只需要评审 {target} 的分析**，不要在评审中讨论或评判你自己的分析。
 
 **第一步：独立审视**
 - 基于你自己的分析框架，列出你认为该问题最关键的 2-3 个判断维度
@@ -238,20 +239,20 @@
 4. 补充点：从你的差异化视角，可以补充哪些关键信息
 5. 对结论的影响：对方的观点是否改变了你的判断？
 
-请对 bull 的分析师进行评审，保持理性客观，用中文回答。
+请对 {target} 的分析师进行评审，保持理性客观，用中文回答。
 ```
 
-#### 🐂 Bull 的 Prompt
+#### 非评审方的 Prompt
 
-**不参与**。Bull 在 critique 阶段不产生任何输出。
+**不参与**。被评审方在 critique 阶段不产生任何输出。
 
 ---
 
-### 2.3 Phase 3: Revise（串行：bull only）
+### 2.3 Phase 3: Revise（串行：被评审方修订）
 
-**调用方式**：`session.revise_stream_single("bull")` —— 只跑 bull 一个角色
+**调用方式**：`session.revise_stream_single(reviser)` —— 只跑被评审方一个角色（奇数轮=bull，偶数轮=bear）
 
-#### 🐂 Bull 的 Prompt（唯一执行者）
+#### 被评审方的 Prompt（唯一执行者）
 
 **System Prompt**：
 ```
@@ -271,14 +272,14 @@
 【此前辩论摘要】{memory_context}
 
 【你之前的分析】
-{bull_answer}            ← Bull 自己上一轮的分析
+{reviser_answer}         ← 被评审方自己上一轮的分析
 
 【历史评审演进】{critique_history}
 > 提示：如果历史评审中的问题你已修正，请在修订说明中明确回应
 
 【收到的评审意见】
-【bear 对你的评审】
-{bear_critique_on_bull}  ← Phase 2 中 Bear 对 Bull 的评审全文
+【{critic} 对你的评审】
+{critic_critique}        ← Phase 2 中评审方对被评审方的评审全文
 
 修订要求：
 1. 先展示你的思考推理过程（放在 <thinking> 标签内）
@@ -296,9 +297,9 @@
 **更新后的置信度**：X%
 ```
 
-#### 🐻 Bear 的 Prompt
+#### 非修订方的 Prompt
 
-**不参与**。Bear 的答案从 Generate 后保持不变。
+**不参与**。评审方的答案在本轮保持不变（将在下一轮被评审）。
 
 ---
 
@@ -396,12 +397,13 @@
 |------|---------|----------|
 | `current_round` | 1 | 2, 3, ... |
 | Generate | ✅ 执行（并行双方） | ❌ 不执行 |
-| Critique | bear → bull | bear → bull（基于 bull 的**修订后**答案） |
-| Revise | bull 根据 bear 的评审修订 | bull 根据 bear 的**新一轮**评审继续修订 |
+| Critique | bear → bull | bull → bear（基于 bear 的**修订后**答案） |
+| Revise | bull 根据 bear 的评审修订 | bear 根据 bull 的评审修订 |
 | `critique_history` | 空 | 包含 Round 1 的评审摘要，避免重复指出已修正问题 |
 | `memory_context` | 可能为空 | 包含 Working Memory 摘要 |
 
 **关键变化在 Critique 的 User Prompt 中**：
-- Round 1：`【bull 的分析】` = bull 的初始答案
-- Round 2：`【bull 的分析】` = bull **修订后**的答案（bear 看到的是最新版本）
+- Round 1（奇数轮）：`【bull 的分析】` = bull 的初始答案，bear 评审 bull
+- Round 2（偶数轮）：`【bear 的分析】` = bear 的初始答案（或上一轮修订后的答案），bull 评审 bear
+- Round 3+：被评审方看到的是对方**最新修订后**的答案
 - `【历史评审记录】` 会注入以往轮次的评审摘要，提示模型避免重复指出已修正的问题

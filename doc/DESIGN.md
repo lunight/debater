@@ -1,6 +1,6 @@
 # 多模型辩论系统 (Debater) — 设计与实现文档
 
-> 版本: 2026-05-17
+> 版本: 2026-05-19
 > 状态: 生产中
 
 ---
@@ -213,13 +213,72 @@ if hasattr(event, "delta") and event.delta:
 
 ---
 
+### 3.2.5 公共引擎 (`debater/engine.py`)
+
+#### 3.2.5.1 设计目标
+
+- **消除代码重复**：提取 `session.py` 和 `nodes.py` 共用的纯工具函数
+- **纯函数设计**：无状态、无 side effect，便于单元测试
+- **统一解析逻辑**：置信度提取、thinking/summary 解析、Judge 输出解析
+
+#### 3.2.5.2 核心函数
+
+```python
+# 从模型输出中提取置信度（支持数据缺失强制降权）
+def extract_confidence(text: str) -> float
+
+# 提取 <thinking> 标签并清理 tool_call XML
+def extract_thinking(text: str) -> Tuple[str, str]
+
+# 提取 <summary> 总结块
+def extract_summary(text: str) -> str
+
+# 清理文本中的 tool_call / tool_result XML 标签
+def clean_tool_tags(text: str) -> str
+
+# 解析 Judge 模型输出（4 层 fallback：json块 → 裸json → 关键词提取 → 默认）
+def parse_judge_output(text: str) -> dict
+```
+
+#### 3.2.5.3 Judge 解析的 4 层 Fallback
+
+```
+模型输出文本
+    │
+    ▼
+┌─────────────────────┐
+│ 1. ```json 代码块   │──成功→ json.loads
+│    (最常见)         │
+└──────────┬──────────┘
+           │ 失败
+           ▼
+┌─────────────────────┐
+│ 2. 裸 JSON { ... }  │──成功→ json.loads
+│    (模型省略标记)   │
+└──────────┬──────────┘
+           │ 失败
+           ▼
+┌─────────────────────┐
+│ 3. 关键词提取       │──在文本中搜索 "stop"/"need_info"
+│    (模型用自然语言) │
+└──────────┬──────────┘
+           │ 未匹配
+           ▼
+┌─────────────────────┐
+│ 4. 默认 fallback    │──action="continue"
+│    (安全保守)       │
+└─────────────────────┘
+```
+
+---
+
 ### 3.3 辩论会话 (`debater/session.py`)
 
 #### 3.3.1 设计目标
 
 - **手动控制流**：每个阶段结束后暂停，等待用户决策（继续/跳过/结束）
 - **流式并行**：generate / brainstorm 阶段多角色同时生成，Token 实时展示
-- **串行交替**：critique → revise → judge 严格串行（bear 先 critique bull，bull 再 revise）
+- **串行交替**：critique → revise → judge 严格串行，角色按轮次交替（奇数轮 bear→bull，偶数轮 bull→bear）
 - **角色-模型解耦**：状态以 role_id 为 key，同一模型可扮演两个角色
 - **状态持久**：支持 Streamlit 的 `st.session_state` 模式
 - **工具调用双轮+回退**：第一轮生成 → 检测 tool call / 回退搜索 → 执行 → 第二轮注入结果
@@ -272,7 +331,7 @@ self.critiques: Dict[str, Dict[str, str]]  # role_id → {target_role_id: critiq
          │                ▼
          │    ┌───────────────────────┐
          │    │     CRITIQUING        │
-         │    │   (bear → bull, 串行) │
+         │    │   (交替方向, 串行)    │
          │    └───────────┬───────────┘
          │                │
          │                ▼
@@ -283,7 +342,7 @@ self.critiques: Dict[str, Dict[str, str]]  # role_id → {target_role_id: critiq
          │                ▼
          │    ┌───────────────────────┐
          │    │      REVISING         │
-         │    │    (bull only, 串行)  │
+         │    │    (被评审方, 串行)   │
          │    └───────────┬───────────┘
          │                │
          │                ▼
@@ -373,12 +432,12 @@ def step_stream(self) -> Generator[Dict, None, None]:
     if self.stage == Stage.INIT:
         yield from self.generate_stream_parallel()          # step_type="generate"
     elif self.stage == Stage.PAUSE_AFTER_GENERATE:
-        yield from self.critique_stream_single("bear", "bull")  # step_type="critique"
+        yield from self.critique_stream_single(*self._get_critique_pair())  # step_type="critique"
     elif self.stage == Stage.PAUSE_AFTER_CRITIQUE:
-        yield from self.revise_stream_single("bull")        # step_type="revise"
+        yield from self.revise_stream_single(self._get_reviser())        # step_type="revise"
     elif self.stage == Stage.PAUSE_AFTER_REVISE:
         self.current_round += 1
-        yield from self.critique_stream_single("bear", "bull")  # step_type="critique"
+        yield from self.critique_stream_single(*self._get_critique_pair())  # step_type="critique"
 
 def step(self) -> Dict[str, Any]:
     """同步版：消费 step_stream() 后返回 ui_state"""
@@ -756,6 +815,25 @@ Skill 内容在 prompt 中作为 Layer 2 尾部注入：
 写入 memories/working_memory.md
 ```
 
+#### 3.8.3 启用开关
+
+Memory 系统默认**关闭**（`enable_memory=False`），以减少不必要的 LLM 调用。仅在长程辩论（>5 轮）或需要生成 Obsidian 文档时建议开启：
+
+```python
+session = DebateSession(
+    question="...",
+    scenario_type="question_analysis",
+    context="",
+    enable_memory=True,  # 开启记忆系统
+)
+```
+
+关闭时：
+- `memory_manager` 保持为 `None`
+- `_update_memory()` 和 `_maybe_summarize()` 直接返回，不调用 LLM
+- 不生成 `working_memory.md` 或 `stage_memory`
+- `finish_debate()` 仍可用，但不会生成 Obsidian 文档
+
 ---
 
 ### 3.9 Streamlit UI (`streamlit_app.py`)
@@ -917,7 +995,7 @@ else:
                      │
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Phase 2: Critique (串行: bear → bull)                        │
+│ Phase 2: Critique (串行: 交替方向)                           │
 │ - 只有 bear 评审 bull 的回答                                 │
 │ - Bear: 挑错、找漏洞、事实核查                               │
 │ - 不再并行双方互相评审，保证一方基于最新输出反应              │
@@ -925,7 +1003,7 @@ else:
                      │
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Phase 3: Revise (串行: bull only)                            │
+│ Phase 3: Revise (串行: 被评审方修订)                         │
 │ - 只有 bull 根据 bear 的评审意见修订回答                     │
 │ - 置信度重新评估                                             │
 │ - bear 的答案保持 generate 阶段结果不变                      │

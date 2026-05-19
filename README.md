@@ -158,8 +158,8 @@ python examples/stock_analysis_example.py
 ## 辩论流程
 
 1. **Generate（生成）**：所有模型并行给出初始分析和结论
-2. **Critique（评审）**：每个模型评审其他模型的观点，指出问题或补充
-3. **Revise（修订）**：模型根据评审意见修订自己的结论
+2. **Critique（评审）**：双方按轮次交替评审（奇数轮 bear→bull，偶数轮 bull→bear）
+3. **Revise（修订）**：被评审方根据评审意见修订自己的结论
 4. **Judge（裁判）**：检查是否达成共识或达到最大轮次
 5. **Aggregate（聚合）**：综合所有观点，输出最终结论
 
@@ -170,12 +170,12 @@ debater/
 ├── config.yaml.template       # 配置模板（复制为 config.yaml 后编辑）
 ├── .env.example               # 环境变量示例
 ├── requirements.txt
-├── app.py                     # 应用入口
 ├── streamlit_app.py           # Streamlit Web UI
 ├── interactive.py             # 交互式入口
 ├── debater/
 │   ├── config.py              # 配置加载与管理
 │   ├── llm_client.py          # 统一 LLM 客户端
+│   ├── engine.py              # 公共引擎（置信度提取、Judge 解析等纯函数）
 │   ├── state.py               # LangGraph 状态定义
 │   ├── prompts.py             # Prompt 模板
 │   ├── roles.py               # 角色定义
